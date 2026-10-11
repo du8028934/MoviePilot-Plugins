@@ -29,7 +29,7 @@ class DuCMSNotify(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/imaliang/MoviePilot-Plugins/main/icons/cms.png"
     # 插件版本
-    plugin_version = "0.8"
+    plugin_version = "0.9"
     # 插件作者
     plugin_author = "du8028934"
     # 作者主页
@@ -52,6 +52,10 @@ class DuCMSNotify(_PluginBase):
     # 已经通知过的整理记录
     _last_history_id = 0
     _pending_history_id = 0
+    # 已经写过日志的记录，避免每分钟重复刷同一条
+    _announced_history_id = 0
+    _notify_failed_history_id = 0
+    _last_error = None
 
     def init_plugin(self, config: dict = None):
         if config:
@@ -450,26 +454,32 @@ class DuCMSNotify(_PluginBase):
 
     def __recent_cloud_transfer(self):
         """
-        从最近的成功整理记录里找出尚未通知过的 115/CloudDrive 入库。
+        取比上次通知更新的一条 115/CloudDrive 入库。没有新记录时不写日志。
         """
+        from app.db import SessionFactory
         from app.db.models.transferhistory import TransferHistory
 
-        rows = TransferHistory.list_by_page(page=1, count=30, status=True) or []
-        saw_cloud = False
-        for row in rows:
-            storage = row.dest_storage
-            if not storage and isinstance(row.dest_fileitem, dict):
-                storage = row.dest_fileitem.get("storage")
-            if storage not in self._CLOUD_STORAGES:
-                continue
-            saw_cloud = True
-            if not row.id or row.id <= (self._last_history_id or 0):
-                continue
-            return row, storage
-        if not saw_cloud:
-            newest = rows[0].dest_storage if rows else None
-            logger.info(f"CMS通知测试检查整理记录：最近入库存储是 {newest}，没有新的115/CloudDrive入库")
-        return None, None
+        db = SessionFactory()
+        try:
+            row = (
+                db.query(TransferHistory)
+                .filter(TransferHistory.status.is_(True))
+                .filter(TransferHistory.id > (self._last_history_id or 0))
+                .filter(TransferHistory.dest_storage.in_(self._CLOUD_STORAGES))
+                .order_by(TransferHistory.id.desc())
+                .first()
+            )
+            if not row:
+                return None, None
+            return {
+                "id": row.id,
+                "title": row.title,
+                "dest": row.dest,
+                "date": row.date,
+                "storage": row.dest_storage,
+            }, row.dest_storage
+        finally:
+            db.close()
 
     @staticmethod
     def __parse_history_time(value: Optional[str]) -> int:
@@ -490,14 +500,16 @@ class DuCMSNotify(_PluginBase):
         row, storage = self.__recent_cloud_transfer()
         if not row:
             return
-        happened_at = self.__parse_history_time(row.date)
-        self._pending_history_id = row.id
+        happened_at = self.__parse_history_time(row.get("date"))
+        self._pending_history_id = row["id"]
         self._wait_notify_count = max(self._wait_notify_count, 1)
         if happened_at:
-            self._last_event_time = max(self._last_event_time, happened_at)
-        logger.info(
-            f"发现新的115整理：{row.title or row.dest}，存储：{storage}，记录：{row.id}"
-        )
+            self._last_event_time = happened_at
+        if row["id"] != self._announced_history_id:
+            self._announced_history_id = row["id"]
+            logger.info(
+                f"发现新的115整理：{row.get('title') or row.get('dest')}，存储：{storage}，记录：{row['id']}"
+            )
 
     def __notify_cms(self):
         try:
@@ -516,20 +528,22 @@ class DuCMSNotify(_PluginBase):
                 if ret:
                     logger.info("通知CMS执行增量同步成功")
                     self._wait_notify_count = 0
+                    self._notify_failed_history_id = 0
                     if self._pending_history_id:
                         self._last_history_id = self._pending_history_id
                         self.plugindata.save("DuCMSNotify", "last_history_id", self._last_history_id)
-                elif ret is not None:
-                    logger.error(
-                        f"通知CMS失败，状态码：{ret.status_code}，返回信息：{ret.text} {ret.reason}")
-                else:
-                    logger.error("通知CMS失败，未获取到返回信息")
-            else:
-                if self._wait_notify_count > 0:
-                    logger.info(
-                        f"等待通知数量：{self._wait_notify_count}，最后事件时间：{self._last_event_time}")
+                elif self._notify_failed_history_id != self._pending_history_id:
+                    self._notify_failed_history_id = self._pending_history_id
+                    if ret is not None:
+                        logger.error(
+                            f"通知CMS失败，记录：{self._pending_history_id}，状态码：{ret.status_code}，返回信息：{ret.text} {ret.reason}")
+                    else:
+                        logger.error(f"通知CMS失败，记录：{self._pending_history_id}，未获取到返回信息")
         except Exception as e:
-            logger.error(f"通知CMS发生异常：{e}")
+            message = str(e)
+            if message != self._last_error:
+                self._last_error = message
+                logger.error(f"通知CMS发生异常：{e}")
 
     def stop_service(self):
         """

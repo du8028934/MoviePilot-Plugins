@@ -3,14 +3,15 @@
         "name": "CMS通知测试",
         "description": "整理完成115里的媒体后，通知CMS进行增量同步（strm生成），并支持连接测试",
         "labels": "消息通知,媒体库,STRM",
-        "version": "0.8",
+        "version": "0.9",
         "icon": "https://raw.githubusercontent.com/imaliang/MoviePilot-Plugins/main/icons/cms.png",
         "author": "du8028934",
         "level": 1,
         "history": {
             "v0.6": "独立插件ID，避免与原版CMS通知合并，并增加连接测试",
             "v0.7": "直接读取整理结果里的存储类型，避免事件转换失败后不通知CMS",
-            "v0.8": "定时任务直接检查整理记录，事件监听未触发时仍通知CMS"
+            "v0.8": "定时任务直接检查整理记录，事件监听未触发时仍通知CMS",
+            "v0.9": "只查询比上次通知更新的整理记录，同一条不再重复写日志"
         }
     }
 }
