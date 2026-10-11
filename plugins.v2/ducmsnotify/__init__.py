@@ -5,7 +5,6 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from apscheduler.triggers.cron import CronTrigger
 from pydantic import BaseModel
 
-from app.core.config import settings
 from app.core.event import eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
@@ -30,7 +29,7 @@ class DuCMSNotify(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/imaliang/MoviePilot-Plugins/main/icons/cms.png"
     # 插件版本
-    plugin_version = "0.6"
+    plugin_version = "0.7"
     # 插件作者
     plugin_author = "du8028934"
     # 作者主页
@@ -315,10 +314,32 @@ class DuCMSNotify(_PluginBase):
     def get_page(self) -> List[dict]:
         pass
 
+    _CLOUD_STORAGES = ("u115", "115网盘Plus", "CloudDrive储存", "CloudDrive2储存")
+
+    @staticmethod
+    def __read_field(obj, key: str):
+        """
+        从字典或对象上读取字段，整理事件里的数据两种形态都有。
+        """
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
     @eventmanager.register(EventType)
     def monitor(self, event):
         """
-        监听事件
+        监听整理完成和刮削完成，记下需要通知 CMS 的次数。
+        """
+        try:
+            self.__handle_monitor_event(event)
+        except Exception as err:
+            logger.error(f"CMS通知测试处理事件失败：{err}")
+
+    def __handle_monitor_event(self, event):
+        """
+        判断本次整理或刮削是否落在 115/CloudDrive 上。
         """
         if not self._enabled or not self._cms_domain or not self._cms_api_token:
             return
@@ -326,57 +347,33 @@ class DuCMSNotify(_PluginBase):
         if not event or not event.event_type:
             return
 
-        def __to_dict(_event):
-            """
-            递归将对象转换为字典
-            """
-            if isinstance(_event, dict):
-                for k, v in _event.items():
-                    _event[k] = __to_dict(v)
-                return _event
-            elif isinstance(_event, list):
-                for i in range(len(_event)):
-                    _event[i] = __to_dict(_event[i])
-                return _event
-            elif isinstance(_event, tuple):
-                return tuple(__to_dict(list(_event)))
-            elif isinstance(_event, set):
-                return set(__to_dict(list(_event)))
-            elif hasattr(_event, 'to_dict'):
-                return __to_dict(_event.to_dict())
-            elif hasattr(_event, '__dict__'):
-                return __to_dict(_event.__dict__)
-            elif isinstance(_event, (int, float, str, bool, type(None))):
-                return _event
-            else:
-                return str(_event)
-
-        version = getattr(settings, "VERSION_FLAG", "v1")
-        event_type = event.event_type if version == "v1" else event.event_type.value
-        logger.debug(f"event_type: {event_type}")
-        logger.debug(f"event_data: {event.event_data}")
-        if event_type not in ["transfer.complete", "metadata.scrape"]:
+        event_type = getattr(event.event_type, "value", event.event_type)
+        if event_type not in ("transfer.complete", "metadata.scrape"):
             return
-        event_data = __to_dict(event.event_data)
 
-        logger.debug(f"event_data: {event_data}")
+        event_data = event.event_data or {}
         if event_type == "transfer.complete":
-            transferinfo = event_data["transferinfo"]
-            success = transferinfo["success"]
-            if success:
-                storage = transferinfo["target_diritem"]["storage"]
-                name = transferinfo["target_item"]["name"]
-                if storage in ("u115", "115网盘Plus", 'CloudDrive储存'):
-                    logger.info(f"115整理完成：{name}")
-                    self._wait_notify_count += 1
-                    self._last_event_time = self.__get_time()
-        elif event_type == "metadata.scrape":
-            storage = event_data["fileitem"]
-            name = event_data["name"]
-            if storage in ("u115", "115网盘Plus", 'CloudDrive储存'):
+            transferinfo = self.__read_field(event_data, "transferinfo")
+            if not self.__read_field(transferinfo, "success"):
+                return
+            target_diritem = self.__read_field(transferinfo, "target_diritem")
+            target_item = self.__read_field(transferinfo, "target_item")
+            storage = self.__read_field(target_diritem, "storage") or self.__read_field(target_item, "storage")
+            name = self.__read_field(target_item, "name") or self.__read_field(target_diritem, "name")
+            if storage in self._CLOUD_STORAGES:
+                logger.info(f"115整理完成：{name}，存储：{storage}")
                 self._wait_notify_count += 1
                 self._last_event_time = self.__get_time()
-                logger.info(f"115刮削完成：{name}")
+            else:
+                logger.info(f"整理完成但存储不匹配，跳过CMS通知：{name}，存储：{storage}")
+        elif event_type == "metadata.scrape":
+            fileitem = self.__read_field(event_data, "fileitem")
+            storage = self.__read_field(fileitem, "storage")
+            name = self.__read_field(event_data, "name") or self.__read_field(fileitem, "name")
+            if storage in self._CLOUD_STORAGES:
+                self._wait_notify_count += 1
+                self._last_event_time = self.__get_time()
+                logger.info(f"115刮削完成：{name}，存储：{storage}")
 
     def __get_time(self):
         return int(time.time())
