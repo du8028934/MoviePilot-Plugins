@@ -29,7 +29,7 @@ class DuCMSNotify(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/imaliang/MoviePilot-Plugins/main/icons/cms.png"
     # 插件版本
-    plugin_version = "0.7"
+    plugin_version = "0.8"
     # 插件作者
     plugin_author = "du8028934"
     # 作者主页
@@ -49,6 +49,9 @@ class DuCMSNotify(_PluginBase):
     _last_event_time = 0
     # 等待通知数量
     _wait_notify_count = 0
+    # 已经通知过的整理记录
+    _last_history_id = 0
+    _pending_history_id = 0
 
     def init_plugin(self, config: dict = None):
         if config:
@@ -56,6 +59,11 @@ class DuCMSNotify(_PluginBase):
             self._cms_notify_type = config.get("cms_notify_type")
             self._cms_domain = config.get("cms_domain")
             self._cms_api_token = config.get('cms_api_token')
+        saved = self.plugindata.get_data("DuCMSNotify", "last_history_id")
+        try:
+            self._last_history_id = int(saved or 0)
+        except (TypeError, ValueError):
+            self._last_history_id = 0
 
     def get_state(self) -> bool:
         return self._enabled
@@ -440,8 +448,60 @@ class DuCMSNotify(_PluginBase):
         logger.info(f"测试CMS连接成功：{domain}")
         return Response(success=True, message=f"连接成功：{message or 'CMS 已接受请求'}")
 
+    def __recent_cloud_transfer(self):
+        """
+        从最近的成功整理记录里找出尚未通知过的 115/CloudDrive 入库。
+        """
+        from app.db.models.transferhistory import TransferHistory
+
+        rows = TransferHistory.list_by_page(page=1, count=30, status=True) or []
+        saw_cloud = False
+        for row in rows:
+            storage = row.dest_storage
+            if not storage and isinstance(row.dest_fileitem, dict):
+                storage = row.dest_fileitem.get("storage")
+            if storage not in self._CLOUD_STORAGES:
+                continue
+            saw_cloud = True
+            if not row.id or row.id <= (self._last_history_id or 0):
+                continue
+            return row, storage
+        if not saw_cloud:
+            newest = rows[0].dest_storage if rows else None
+            logger.info(f"CMS通知测试检查整理记录：最近入库存储是 {newest}，没有新的115/CloudDrive入库")
+        return None, None
+
+    @staticmethod
+    def __parse_history_time(value: Optional[str]) -> int:
+        """
+        把整理记录上的时间转成秒。
+        """
+        if not value:
+            return 0
+        try:
+            return int(time.mktime(time.strptime(str(value), "%Y-%m-%d %H:%M:%S")))
+        except Exception:
+            return 0
+
+    def __absorb_history(self):
+        """
+        用整理记录补充事件监听，事件没送到时仍能发现新入库。
+        """
+        row, storage = self.__recent_cloud_transfer()
+        if not row:
+            return
+        happened_at = self.__parse_history_time(row.date)
+        self._pending_history_id = row.id
+        self._wait_notify_count = max(self._wait_notify_count, 1)
+        if happened_at:
+            self._last_event_time = max(self._last_event_time, happened_at)
+        logger.info(
+            f"发现新的115整理：{row.title or row.dest}，存储：{storage}，记录：{row.id}"
+        )
+
     def __notify_cms(self):
         try:
+            self.__absorb_history()
             # 当等待通知数量超过1000或者有等待通知且最后事件时间超过60秒时触发通知
             if self._wait_notify_count > 0 and (self._wait_notify_count > 1000 or self.__get_time() - self._last_event_time > 60):
                 url = self.__build_cms_url(
@@ -456,6 +516,9 @@ class DuCMSNotify(_PluginBase):
                 if ret:
                     logger.info("通知CMS执行增量同步成功")
                     self._wait_notify_count = 0
+                    if self._pending_history_id:
+                        self._last_history_id = self._pending_history_id
+                        self.plugindata.save("DuCMSNotify", "last_history_id", self._last_history_id)
                 elif ret is not None:
                     logger.error(
                         f"通知CMS失败，状态码：{ret.status_code}，返回信息：{ret.text} {ret.reason}")
