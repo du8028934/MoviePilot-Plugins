@@ -1,5 +1,5 @@
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from apscheduler.triggers.cron import CronTrigger
