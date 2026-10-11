@@ -1,18 +1,14 @@
 {
-    "CMSNotify": {
-        "name": "CMS通知",
-        "description": "整理完成115里的媒体后，通知CMS进行增量同步（strm生成）",
+    "DuCMSNotify": {
+        "name": "CMS通知测试",
+        "description": "整理完成115里的媒体后，通知CMS进行增量同步（strm生成），并支持连接测试",
         "labels": "消息通知,媒体库,STRM",
         "version": "0.6",
         "icon": "https://raw.githubusercontent.com/imaliang/MoviePilot-Plugins/main/icons/cms.png",
-        "author": "imaliang",
+        "author": "du8028934",
         "level": 1,
         "history": {
-            "v0.6": "增加CMS连接测试",
-            "v0.5": "支持CloudDrive储存",
-            "v0.4": "支持115网盘Plus",
-            "v0.3": "支持通知cms进行自动整理",
-            "v0.2": "整理完成115里的媒体后，通知CMS进行增量同步（strm生成）"
+            "v0.6": "独立插件ID，避免与原版CMS通知合并，并增加连接测试"
         }
     }
 }
