@@ -29,7 +29,7 @@ class DuCMSNotify(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/imaliang/MoviePilot-Plugins/main/icons/cms.png"
     # 插件版本
-    plugin_version = "0.9"
+    plugin_version = "0.10"
     # 插件作者
     plugin_author = "du8028934"
     # 作者主页
@@ -49,25 +49,19 @@ class DuCMSNotify(_PluginBase):
     _last_event_time = 0
     # 等待通知数量
     _wait_notify_count = 0
-    # 已经通知过的整理记录
-    _last_history_id = 0
-    _pending_history_id = 0
-    # 已经写过日志的记录，避免每分钟重复刷同一条
-    _announced_history_id = 0
-    _notify_failed_history_id = 0
-    _last_error = None
+    _notify_failed = False
 
     def init_plugin(self, config: dict = None):
+        """
+        生效配置，并重新打开整理完成事件监听。
+        """
         if config:
             self._enabled = config.get("enabled")
             self._cms_notify_type = config.get("cms_notify_type")
             self._cms_domain = config.get("cms_domain")
             self._cms_api_token = config.get('cms_api_token')
-        saved = self.plugindata.get_data("DuCMSNotify", "last_history_id")
-        try:
-            self._last_history_id = int(saved or 0)
-        except (TypeError, ValueError):
-            self._last_history_id = 0
+        if self.get_state():
+            eventmanager.enable_event_handler(type(self))
 
     def get_state(self) -> bool:
         return self._enabled
@@ -339,53 +333,40 @@ class DuCMSNotify(_PluginBase):
             return obj.get(key)
         return getattr(obj, key, None)
 
-    @eventmanager.register(EventType)
+    @eventmanager.register(EventType.TransferComplete)
     def monitor(self, event):
         """
-        监听整理完成和刮削完成，记下需要通知 CMS 的次数。
+        监听入库成功事件。该事件与「已入库」消息发自同一次整理完成。
         """
         try:
-            self.__handle_monitor_event(event)
+            self.__handle_transfer_complete(event)
         except Exception as err:
-            logger.error(f"CMS通知测试处理事件失败：{err}")
+            logger.error(f"CMS通知测试处理入库事件失败：{err}")
 
-    def __handle_monitor_event(self, event):
+    def __handle_transfer_complete(self, event):
         """
-        判断本次整理或刮削是否落在 115/CloudDrive 上。
+        媒体文件入库成功后，记录一次待同步。目录开启通知时，随后会发出已入库消息。
         """
         if not self._enabled or not self._cms_domain or not self._cms_api_token:
             return
-
-        if not event or not event.event_type:
-            return
-
-        event_type = getattr(event.event_type, "value", event.event_type)
-        if event_type not in ("transfer.complete", "metadata.scrape"):
+        if not event:
             return
 
         event_data = event.event_data or {}
-        if event_type == "transfer.complete":
-            transferinfo = self.__read_field(event_data, "transferinfo")
-            if not self.__read_field(transferinfo, "success"):
-                return
-            target_diritem = self.__read_field(transferinfo, "target_diritem")
-            target_item = self.__read_field(transferinfo, "target_item")
-            storage = self.__read_field(target_diritem, "storage") or self.__read_field(target_item, "storage")
-            name = self.__read_field(target_item, "name") or self.__read_field(target_diritem, "name")
-            if storage in self._CLOUD_STORAGES:
-                logger.info(f"115整理完成：{name}，存储：{storage}")
-                self._wait_notify_count += 1
-                self._last_event_time = self.__get_time()
-            else:
-                logger.info(f"整理完成但存储不匹配，跳过CMS通知：{name}，存储：{storage}")
-        elif event_type == "metadata.scrape":
-            fileitem = self.__read_field(event_data, "fileitem")
-            storage = self.__read_field(fileitem, "storage")
-            name = self.__read_field(event_data, "name") or self.__read_field(fileitem, "name")
-            if storage in self._CLOUD_STORAGES:
-                self._wait_notify_count += 1
-                self._last_event_time = self.__get_time()
-                logger.info(f"115刮削完成：{name}，存储：{storage}")
+        transferinfo = self.__read_field(event_data, "transferinfo")
+        if not self.__read_field(transferinfo, "success"):
+            return
+        target_diritem = self.__read_field(transferinfo, "target_diritem")
+        target_item = self.__read_field(transferinfo, "target_item")
+        storage = self.__read_field(target_diritem, "storage") or self.__read_field(target_item, "storage")
+        name = self.__read_field(target_item, "name") or self.__read_field(target_diritem, "name")
+        if storage not in self._CLOUD_STORAGES:
+            logger.info(f"入库完成但存储不匹配，跳过CMS通知：{name}，存储：{storage}")
+            return
+        logger.info(f"入库完成：{name}，存储：{storage}")
+        self._wait_notify_count += 1
+        self._last_event_time = self.__get_time()
+        self._notify_failed = False
 
     def __get_time(self):
         return int(time.time())
@@ -452,98 +433,42 @@ class DuCMSNotify(_PluginBase):
         logger.info(f"测试CMS连接成功：{domain}")
         return Response(success=True, message=f"连接成功：{message or 'CMS 已接受请求'}")
 
-    def __recent_cloud_transfer(self):
-        """
-        取比上次通知更新的一条 115/CloudDrive 入库。没有新记录时不写日志。
-        """
-        from app.db import SessionFactory
-        from app.db.models.transferhistory import TransferHistory
-
-        db = SessionFactory()
-        try:
-            row = (
-                db.query(TransferHistory)
-                .filter(TransferHistory.status.is_(True))
-                .filter(TransferHistory.id > (self._last_history_id or 0))
-                .filter(TransferHistory.dest_storage.in_(self._CLOUD_STORAGES))
-                .order_by(TransferHistory.id.desc())
-                .first()
-            )
-            if not row:
-                return None, None
-            return {
-                "id": row.id,
-                "title": row.title,
-                "dest": row.dest,
-                "date": row.date,
-                "storage": row.dest_storage,
-            }, row.dest_storage
-        finally:
-            db.close()
-
-    @staticmethod
-    def __parse_history_time(value: Optional[str]) -> int:
-        """
-        把整理记录上的时间转成秒。
-        """
-        if not value:
-            return 0
-        try:
-            return int(time.mktime(time.strptime(str(value), "%Y-%m-%d %H:%M:%S")))
-        except Exception:
-            return 0
-
-    def __absorb_history(self):
-        """
-        用整理记录补充事件监听，事件没送到时仍能发现新入库。
-        """
-        row, storage = self.__recent_cloud_transfer()
-        if not row:
-            return
-        happened_at = self.__parse_history_time(row.get("date"))
-        self._pending_history_id = row["id"]
-        self._wait_notify_count = max(self._wait_notify_count, 1)
-        if happened_at:
-            self._last_event_time = happened_at
-        if row["id"] != self._announced_history_id:
-            self._announced_history_id = row["id"]
-            logger.info(
-                f"发现新的115整理：{row.get('title') or row.get('dest')}，存储：{storage}，记录：{row['id']}"
-            )
-
     def __notify_cms(self):
+        """
+        入库事件安静超过 60 秒后，通知 CMS 做一次增量同步。
+        """
+        if self._wait_notify_count <= 0:
+            return
+        if self._wait_notify_count <= 1000 and self.__get_time() - self._last_event_time <= 60:
+            return
         try:
-            self.__absorb_history()
-            # 当等待通知数量超过1000或者有等待通知且最后事件时间超过60秒时触发通知
-            if self._wait_notify_count > 0 and (self._wait_notify_count > 1000 or self.__get_time() - self._last_event_time > 60):
-                url = self.__build_cms_url(
-                    domain=self._cms_domain,
-                    token=self._cms_api_token,
-                    notify_type=self._cms_notify_type,
-                )
-                if not url:
+            url = self.__build_cms_url(
+                domain=self._cms_domain,
+                token=self._cms_api_token,
+                notify_type=self._cms_notify_type,
+            )
+            if not url:
+                if not self._notify_failed:
+                    self._notify_failed = True
                     logger.error("CMS地址或Token无效，无法通知")
-                    return
-                ret = RequestUtils().get_res(url)
-                if ret:
-                    logger.info("通知CMS执行增量同步成功")
-                    self._wait_notify_count = 0
-                    self._notify_failed_history_id = 0
-                    if self._pending_history_id:
-                        self._last_history_id = self._pending_history_id
-                        self.plugindata.save("DuCMSNotify", "last_history_id", self._last_history_id)
-                elif self._notify_failed_history_id != self._pending_history_id:
-                    self._notify_failed_history_id = self._pending_history_id
-                    if ret is not None:
-                        logger.error(
-                            f"通知CMS失败，记录：{self._pending_history_id}，状态码：{ret.status_code}，返回信息：{ret.text} {ret.reason}")
-                    else:
-                        logger.error(f"通知CMS失败，记录：{self._pending_history_id}，未获取到返回信息")
-        except Exception as e:
-            message = str(e)
-            if message != self._last_error:
-                self._last_error = message
-                logger.error(f"通知CMS发生异常：{e}")
+                return
+            ret = RequestUtils().get_res(url)
+            if ret:
+                logger.info("通知CMS执行增量同步成功")
+                self._wait_notify_count = 0
+                self._notify_failed = False
+                return
+            if self._notify_failed:
+                return
+            self._notify_failed = True
+            if ret is not None:
+                logger.error(f"通知CMS失败，状态码：{ret.status_code}，返回信息：{ret.text} {ret.reason}")
+            else:
+                logger.error("通知CMS失败，未获取到返回信息")
+        except Exception as err:
+            if not self._notify_failed:
+                self._notify_failed = True
+                logger.error(f"通知CMS发生异常：{err}")
 
     def stop_service(self):
         """
